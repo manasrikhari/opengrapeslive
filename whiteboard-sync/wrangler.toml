@@ -1,0 +1,17 @@
+name = "opengrapes-whiteboard-sync"
+main = "worker/worker.ts"
+compatibility_date = "2025-05-08"
+compatibility_flags = ["nodejs_compat"]
+account_id = "3769189be78c01f88063383ca4a5d7d1"
+
+[durable_objects]
+bindings = [{ name = "TLDRAW_DURABLE_OBJECT", class_name = "TldrawDurableObject" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TldrawDurableObject"]
+
+[[r2_buckets]]
+binding = 'TLDRAW_BUCKET'
+bucket_name = 'opengrapes-whiteboard-sync'
+preview_bucket_name = 'opengrapes-whiteboard-sync-preview'
