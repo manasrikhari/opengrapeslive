@@ -5,12 +5,6 @@ function getAssetObjectName(uploadId: string) {
 	return `uploads/${uploadId.replace(/[^a-zA-Z0-9_-]+/g, '_')}`
 }
 
-declare global {
-	interface CacheStorage {
-		default: Cache
-	}
-}
-
 // Handles binary asset uploads (images/videos)
 export async function handleAssetUpload(request: IRequest, env: Env) {
 	const objectName = getAssetObjectName(request.params.uploadId)
