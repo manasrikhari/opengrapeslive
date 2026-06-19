@@ -3,6 +3,7 @@ import {
 	type SessionStateSnapshot,
 	SQLiteSyncStorage,
 	TLSocketRoom,
+	type RoomSnapshot,
 } from '@tldraw/sync-core'
 import {
 	createTLSchema,
@@ -34,14 +35,69 @@ export class TldrawDurableObject extends DurableObject {
 		)
 	}
 
+	private async ensureAlarmScheduled() {
+		const currentAlarm = await this.ctx.storage.getAlarm()
+		if (currentAlarm === null) {
+			await this.ctx.storage.setAlarm(Date.now() + 10000)
+		}
+	}
+
+	private checkpoint() {
+		if (!this.room) return
+		try {
+			const snapshot = this.room.getCurrentSnapshot()
+			// RoomSnapshot contains primitive properties, arrays of objects, and simple key-value maps.
+			// It is fully JSON-serializable out of the box.
+			const serialized = JSON.stringify(snapshot)
+
+			this.ctx.storage.sql.exec(
+				`INSERT OR REPLACE INTO whiteboard_snapshots (key, snapshot) VALUES (?, ?)`,
+				'snapshot_v1',
+				serialized
+			)
+		} catch (err) {
+			console.error('Failed to save checkpoint snapshot:', err)
+		}
+	}
+
+	override async alarm() {
+		this.checkpoint()
+		// Only reschedule if we still have active connections
+		if (this.ctx.getWebSockets().length > 0) {
+			await this.ctx.storage.setAlarm(Date.now() + 10000)
+		}
+	}
+
 	private getOrCreateRoom(): TLSocketRoom<TLRecord, void> {
 		if (!this.room) {
-			const sql = new DurableObjectSqliteSyncWrapper(this.ctx.storage)
-			const storage = new SQLiteSyncStorage<TLRecord>({ sql })
+			// Initialize the snapshot table if it doesn't exist
+			this.ctx.storage.sql.exec(`
+				CREATE TABLE IF NOT EXISTS whiteboard_snapshots (
+					key TEXT PRIMARY KEY,
+					snapshot TEXT NOT NULL
+				);
+			`)
 
+			// Fetch the saved snapshot if one exists
+			const rows = this.ctx.storage.sql.exec(
+				`SELECT snapshot FROM whiteboard_snapshots WHERE key = ?`,
+				'snapshot_v1'
+			).toArray() as Array<{ snapshot: string }>
+
+			let initialSnapshot: RoomSnapshot | undefined = undefined
+			if (rows.length > 0) {
+				try {
+					initialSnapshot = JSON.parse(rows[0].snapshot) as RoomSnapshot
+				} catch (err) {
+					console.error('Failed to parse saved snapshot:', err)
+				}
+			}
+
+			// We omit the 'storage' parameter so TLSocketRoom defaults to InMemorySyncStorage,
+			// bypassing incremental SQLite persistence. We pass initialSnapshot to restore state.
 			this.room = new TLSocketRoom<TLRecord, void>({
 				schema,
-				storage,
+				initialSnapshot,
 				clientTimeout: Infinity,
 				onSessionSnapshot: (sessionId, snapshot) => {
 					const ws = this.sessionIdToWs.get(sessionId)
@@ -50,6 +106,7 @@ export class TldrawDurableObject extends DurableObject {
 			})
 
 			// Resume existing WebSocket connections that survived hibernation
+			let hasResumed = false
 			for (const ws of this.ctx.getWebSockets()) {
 				const attachment = ws.deserializeAttachment() as SocketAttachment | null
 				if (!attachment?.sessionId) continue
@@ -60,7 +117,14 @@ export class TldrawDurableObject extends DurableObject {
 						socket: ws,
 						snapshot: attachment.snapshot,
 					})
+					hasResumed = true
 				}
+			}
+
+			if (hasResumed) {
+				this.ctx.blockConcurrencyWhile(async () => {
+					await this.ensureAlarmScheduled()
+				})
 			}
 		}
 		return this.room
@@ -86,6 +150,11 @@ export class TldrawDurableObject extends DurableObject {
 		serverWebSocket.serializeAttachment(attachment)
 
 		this.getOrCreateRoom().handleSocketConnect({ sessionId, socket: serverWebSocket })
+
+		// Call ensureAlarmScheduled when a new WebSocket connection is accepted
+		this.ctx.blockConcurrencyWhile(async () => {
+			await this.ensureAlarmScheduled()
+		})
 
 		return new Response(null, { status: 101, webSocket: clientWebSocket })
 	}
@@ -129,5 +198,12 @@ export class TldrawDurableObject extends DurableObject {
 		}
 
 		room[method](attachment.sessionId)
+
+		// Check if this was the last connection
+		const remainingSockets = this.ctx.getWebSockets().filter(socket => socket !== ws)
+		if (remainingSockets.length === 0) {
+			this.ctx.storage.deleteAlarm()
+			this.checkpoint()
+		}
 	}
 }
